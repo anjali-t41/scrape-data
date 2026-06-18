@@ -337,6 +337,9 @@ class _BaseStore:
         rows = self._fetchall("SELECT session_id FROM session_metas")
         return {r[0] for r in rows}
 
+    def pushed_turn_session_ids(self) -> set[str]:
+        return set()  # SQLite — collect all sessions each run
+
     def pushed_agent_session_ids(self) -> set[str]:
         return set()  # SQLite has no agent_tasks table — collect all sessions
 
@@ -482,19 +485,68 @@ class _PostgresStore:
 
     # ── push ──────────────────────────────────────────────────────────────────
 
-    def push(self, raw: dict) -> dict:
-        from psycopg2.extras import Json
+    def push(self, raw: dict, force: bool = False) -> dict:
+        from psycopg2.extras import Json, execute_values
 
         now = datetime.now(tz=timezone.utc)
         inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0}
         cur = self._conn.cursor()
 
-        # session_metas — one row per session, skip duplicates
+        # In force mode, delete existing rows for all incoming sessions before re-inserting
+        if force:
+            all_sids = (
+                {m.get("session_id") for m in raw.get("session_metas", []) if m.get("session_id")}
+                | {t.get("session_id") for t in raw.get("turn_events", []) if t.get("session_id")}
+                | set(raw.get("facets", {}).keys())
+                | set(raw.get("agent_tasks", {}).keys())
+            )
+            if all_sids:
+                sid_list = list(all_sids)
+                cur.execute("DELETE FROM scrape_data.turn_events  WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.agent_tasks  WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.facets       WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.session_metas WHERE session_id = ANY(%s)", (sid_list,))
+
+        # ── session_metas — bulk insert, skip duplicates ──────────────────────
+        sm_rows = []
         for meta in raw.get("session_metas", []):
             sid = meta.get("session_id")
             if not sid:
                 continue
-            cur.execute(
+            sm_rows.append((
+                sid,
+                meta.get("developer_key", ""),
+                meta.get("claude_dir"),
+                meta.get("account_type"),
+                meta.get("project_path"),
+                meta.get("start_time"),
+                meta.get("week"),
+                meta.get("date"),
+                meta.get("duration_minutes"),
+                meta.get("user_message_count"),
+                meta.get("assistant_message_count"),
+                meta.get("lines_added", 0),
+                meta.get("lines_removed", 0),
+                meta.get("files_modified", 0),
+                meta.get("git_commits", 0),
+                meta.get("git_pushes", 0),
+                meta.get("first_prompt"),
+                meta.get("user_interruptions", 0),
+                meta.get("tool_errors", 0),
+                bool(meta.get("uses_task_agent", False)),
+                bool(meta.get("uses_mcp", False)),
+                bool(meta.get("uses_web_search", False)),
+                bool(meta.get("uses_web_fetch", False)),
+                meta.get("input_tokens", 0),
+                meta.get("output_tokens", 0),
+                Json(meta.get("tool_counts") or {}),
+                Json(meta.get("languages") or {}),
+                Json(meta.get("user_response_times") or []),
+                now,
+            ))
+        if sm_rows:
+            execute_values(
+                cur,
                 """
                 INSERT INTO scrape_data.session_metas (
                     session_id, developer_key, claude_dir, account_type, project_path,
@@ -505,133 +557,122 @@ class _PostgresStore:
                     uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch,
                     input_tokens, output_tokens,
                     tool_counts, languages, user_response_times, pushed_at
-                ) VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                ) ON CONFLICT (session_id) DO NOTHING
+                ) VALUES %s ON CONFLICT (session_id) DO NOTHING
                 """,
-                (
-                    sid,
-                    meta.get("developer_key", ""),
-                    meta.get("claude_dir"),
-                    meta.get("account_type"),
-                    meta.get("project_path"),
-                    meta.get("start_time"),
-                    meta.get("week"),
-                    meta.get("date"),
-                    meta.get("duration_minutes"),
-                    meta.get("user_message_count"),
-                    meta.get("assistant_message_count"),
-                    meta.get("lines_added", 0),
-                    meta.get("lines_removed", 0),
-                    meta.get("files_modified", 0),
-                    meta.get("git_commits", 0),
-                    meta.get("git_pushes", 0),
-                    meta.get("first_prompt"),
-                    meta.get("user_interruptions", 0),
-                    meta.get("tool_errors", 0),
-                    bool(meta.get("uses_task_agent", False)),
-                    bool(meta.get("uses_mcp", False)),
-                    bool(meta.get("uses_web_search", False)),
-                    bool(meta.get("uses_web_fetch", False)),
-                    meta.get("input_tokens", 0),
-                    meta.get("output_tokens", 0),
-                    Json(meta.get("tool_counts") or {}),
-                    Json(meta.get("languages") or {}),
-                    Json(meta.get("user_response_times") or []),
-                    now,
-                ),
+                sm_rows,
             )
-            inserted["session_metas"] += cur.rowcount
+            inserted["session_metas"] = cur.rowcount
 
-        # turn_events — skip sessions already stored (session-level dedup)
+        # ── turn_events — bulk insert, session-level dedup ────────────────────
         existing_te = self._existing_turn_sessions(cur)
+        skill_rows, turn_rows = [], []
         for t in raw.get("turn_events", []):
             sid = t.get("session_id", "")
             if sid in existing_te:
                 continue
-            event_type = t.get("event_type", "turn")
-            if event_type == "skill":
-                cur.execute(
-                    """
-                    INSERT INTO scrape_data.turn_events (
-                        session_id, developer_key, event_type,
-                        user_ts, is_sidechain, agent_colors_in_session, command, pushed_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        sid,
-                        t.get("developer_key", ""),
-                        "skill",
-                        t.get("ts"),
-                        bool(t.get("is_sidechain", False)),
-                        t.get("agent_colors_in_session", 0),
-                        t.get("command"),
-                        now,
-                    ),
-                )
+            if t.get("event_type") == "skill":
+                skill_rows.append((
+                    sid,
+                    t.get("developer_key", ""),
+                    "skill",
+                    t.get("ts"),
+                    bool(t.get("is_sidechain", False)),
+                    t.get("agent_colors_in_session", 0),
+                    t.get("command"),
+                    now,
+                ))
             else:
-                cur.execute(
-                    """
-                    INSERT INTO scrape_data.turn_events (
-                        session_id, developer_key, event_type,
-                        user_ts, assistant_ts, agent_ms,
-                        is_sidechain, permission_mode,
-                        tool_uses, agent_colors_in_session, prompt_text, pushed_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        sid,
-                        t.get("developer_key", ""),
-                        "turn",
-                        t.get("user_ts"),
-                        t.get("assistant_ts"),
-                        t.get("agent_ms"),
-                        bool(t.get("is_sidechain", False)),
-                        t.get("permission_mode"),
-                        Json(t.get("tool_uses") or []),
-                        t.get("agent_colors_in_session", 0),
-                        t.get("prompt_text") or None,
-                        now,
-                    ),
-                )
-            inserted["turn_events"] += 1
+                turn_rows.append((
+                    sid,
+                    t.get("developer_key", ""),
+                    "turn",
+                    t.get("user_ts"),
+                    t.get("assistant_ts"),
+                    t.get("agent_ms"),
+                    bool(t.get("is_sidechain", False)),
+                    t.get("permission_mode"),
+                    Json(t.get("tool_uses") or []),
+                    t.get("agent_colors_in_session", 0),
+                    t.get("prompt_text") or None,
+                    now,
+                ))
+        if skill_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.turn_events (
+                    session_id, developer_key, event_type,
+                    user_ts, is_sidechain, agent_colors_in_session, command, pushed_at
+                ) VALUES %s
+                """,
+                skill_rows,
+            )
+            inserted["turn_events"] += len(skill_rows)
+        if turn_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.turn_events (
+                    session_id, developer_key, event_type,
+                    user_ts, assistant_ts, agent_ms,
+                    is_sidechain, permission_mode,
+                    tool_uses, agent_colors_in_session, prompt_text, pushed_at
+                ) VALUES %s
+                """,
+                turn_rows,
+            )
+            inserted["turn_events"] += len(turn_rows)
 
-        # facets — one row per session, skip duplicates
+        # ── facets — bulk insert, skip duplicates ─────────────────────────────
+        facet_rows = []
         for sid, f in raw.get("facets", {}).items():
-            cur.execute(
+            facet_rows.append((
+                sid,
+                f.get("developer_key"),
+                f.get("underlying_goal"),
+                Json(f.get("goal_categories") or {}),
+                f.get("outcome"),
+                f.get("session_type"),
+                f.get("claude_helpfulness"),
+                Json(f.get("friction_counts") or {}),
+                f.get("friction_detail"),
+                f.get("primary_success"),
+                f.get("brief_summary"),
+                now,
+            ))
+        if facet_rows:
+            execute_values(
+                cur,
                 """
                 INSERT INTO scrape_data.facets (
                     session_id, developer_key, underlying_goal, goal_categories,
                     outcome, session_type, claude_helpfulness,
                     friction_counts, friction_detail, primary_success, brief_summary, pushed_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (session_id) DO NOTHING
+                ) VALUES %s ON CONFLICT (session_id) DO NOTHING
                 """,
-                (
-                    sid,
-                    f.get("developer_key"),
-                    f.get("underlying_goal"),
-                    Json(f.get("goal_categories") or {}),
-                    f.get("outcome"),
-                    f.get("session_type"),
-                    f.get("claude_helpfulness"),
-                    Json(f.get("friction_counts") or {}),
-                    f.get("friction_detail"),
-                    f.get("primary_success"),
-                    f.get("brief_summary"),
-                    now,
-                ),
+                facet_rows,
             )
-            inserted["facets"] += cur.rowcount
+            inserted["facets"] = cur.rowcount
 
-        # app_state — upsert (latest state wins)
+        # ── app_state — bulk upsert ───────────────────────────────────────────
+        as_rows = []
         for dev_key, state in raw.get("app_state", {}).items():
-            cur.execute(
+            as_rows.append((
+                dev_key,
+                state.get("total_startups", 0),
+                bool(state.get("has_used_background_task", False)),
+                Json(state.get("install_methods") or []),
+                Json(state.get("accounts") or []),
+                now,
+            ))
+        if as_rows:
+            execute_values(
+                cur,
                 """
                 INSERT INTO scrape_data.app_state (
                     developer_key, total_startups, has_used_background_task,
                     install_methods, accounts, pushed_at
-                ) VALUES (%s,%s,%s,%s,%s,%s)
+                ) VALUES %s
                 ON CONFLICT (developer_key) DO UPDATE SET
                     total_startups           = EXCLUDED.total_startups,
                     has_used_background_task = EXCLUDED.has_used_background_task,
@@ -639,82 +680,92 @@ class _PostgresStore:
                     accounts                 = EXCLUDED.accounts,
                     pushed_at                = EXCLUDED.pushed_at
                 """,
-                (
-                    dev_key,
-                    state.get("total_startups", 0),
-                    bool(state.get("has_used_background_task", False)),
-                    Json(state.get("install_methods") or []),
-                    Json(state.get("accounts") or []),
-                    now,
-                ),
+                as_rows,
             )
-            inserted["app_state"] += 1
+            inserted["app_state"] = len(as_rows)
 
-        # plans — upsert (latest state wins)
+        # ── plans — bulk upsert ───────────────────────────────────────────────
+        plan_rows = []
         for dev_key, plan_info in raw.get("plans", {}).items():
-            cur.execute(
+            plan_rows.append((
+                dev_key,
+                plan_info.get("total_plans", 0),
+                plan_info.get("new_plans_since_last_run", 0),
+                Json(plan_info.get("plan_names") or []),
+                now,
+            ))
+        if plan_rows:
+            execute_values(
+                cur,
                 """
                 INSERT INTO scrape_data.plans (
                     developer_key, total_plans, new_plans_since_last_run, plan_names, pushed_at
-                ) VALUES (%s,%s,%s,%s,%s)
+                ) VALUES %s
                 ON CONFLICT (developer_key) DO UPDATE SET
                     total_plans              = EXCLUDED.total_plans,
                     new_plans_since_last_run = EXCLUDED.new_plans_since_last_run,
                     plan_names               = EXCLUDED.plan_names,
                     pushed_at                = EXCLUDED.pushed_at
                 """,
-                (
-                    dev_key,
-                    plan_info.get("total_plans", 0),
-                    plan_info.get("new_plans_since_last_run", 0),
-                    Json(plan_info.get("plan_names") or []),
-                    now,
-                ),
+                plan_rows,
             )
-            inserted["plans"] += 1
+            inserted["plans"] = len(plan_rows)
 
-        # agent_tasks — update session_metas with ai_title/agent_names, insert task rows
+        # ── agent_tasks — bulk insert + bulk UPDATE session_metas ────────────
         existing_at = self._existing_agent_sessions(cur)
+        at_rows = []
+        title_updates = []
         for session_id, at_data in raw.get("agent_tasks", {}).items():
             ai_title    = at_data.get("ai_title")
             agent_names = at_data.get("agent_names") or []
             dev_key     = at_data.get("developer_key", "")
-
-            # Backfill ai_title and agent_names onto session_metas (COALESCE preserves existing value)
             if ai_title or agent_names:
-                cur.execute(
-                    """
-                    UPDATE scrape_data.session_metas
-                       SET ai_title    = COALESCE(ai_title, %s),
-                           agent_names = %s
-                     WHERE session_id = %s
-                    """,
-                    (ai_title, Json(agent_names), session_id),
-                )
-
+                title_updates.append((ai_title, Json(agent_names), session_id))
             if session_id in existing_at:
                 continue
             for task in at_data.get("tasks", []):
-                cur.execute(
-                    """
-                    INSERT INTO scrape_data.agent_tasks (
-                        session_id, developer_key, task_id, agent_name,
-                        task_description, status, enqueued_at, week, pushed_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        session_id,
-                        dev_key,
-                        task.get("task_id"),
-                        task.get("agent_name"),
-                        task.get("task_description"),
-                        task.get("status"),
-                        task.get("enqueued_at"),
-                        task.get("week"),
-                        now,
-                    ),
-                )
-                inserted["agent_tasks"] += 1
+                if not task.get("agent_name") and not task.get("task_id"):
+                    continue   # skip ghost rows with no identity
+                at_rows.append((
+                    session_id,
+                    dev_key,
+                    task.get("task_id"),
+                    task.get("agent_name"),
+                    task.get("task_description"),
+                    task.get("status"),
+                    task.get("enqueued_at"),
+                    task.get("week"),
+                    now,
+                ))
+
+        # Bulk UPDATE ai_title/agent_names via temp table
+        if title_updates:
+            cur.execute("""
+                CREATE TEMP TABLE _tmp_titles (
+                    ai_title TEXT, agent_names JSONB, session_id TEXT
+                ) ON COMMIT DROP
+            """)
+            execute_values(cur, "INSERT INTO _tmp_titles VALUES %s", title_updates)
+            cur.execute("""
+                UPDATE scrape_data.session_metas sm
+                   SET ai_title    = COALESCE(sm.ai_title, t.ai_title),
+                       agent_names = t.agent_names
+                  FROM _tmp_titles t
+                 WHERE sm.session_id = t.session_id
+            """)
+
+        if at_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.agent_tasks (
+                    session_id, developer_key, task_id, agent_name,
+                    task_description, status, enqueued_at, week, pushed_at
+                ) VALUES %s
+                """,
+                at_rows,
+            )
+            inserted["agent_tasks"] = len(at_rows)
 
         self._conn.commit()
         return inserted
@@ -735,6 +786,11 @@ class _PostgresStore:
 
     def pushed_session_ids(self) -> set[str]:
         rows = self._fetchall("SELECT session_id FROM scrape_data.session_metas")
+        return {r[0] for r in rows}
+
+    def pushed_turn_session_ids(self) -> set[str]:
+        """Session IDs already in turn_events — used for incremental turn collection."""
+        rows = self._fetchall("SELECT DISTINCT session_id FROM scrape_data.turn_events")
         return {r[0] for r in rows}
 
     def pushed_agent_session_ids(self) -> set[str]:
@@ -843,21 +899,25 @@ class _PostgresStore:
                 "plan_names":               row[3],
             }
 
-        # agent_tasks — keyed by session_id
-        agent_tasks_result: dict[str, list] = {}
+        # agent_tasks — keyed by session_id, same shape as agent_tasks.collect()
+        # {session_id: {developer_key, tasks: [...]}}
+        agent_tasks_result: dict[str, dict] = {}
         if in_scope:
             at_rows = self._fetchall(
-                f"SELECT session_id, task_id, agent_name, task_description, status, enqueued_at "
+                f"SELECT session_id, developer_key, task_id, agent_name, task_description, status, enqueued_at "
                 f"FROM scrape_data.agent_tasks WHERE session_id IN ({ph})",
                 args,
             )
             for row in at_rows:
-                enq = row[5]
-                agent_tasks_result.setdefault(row[0], []).append({
-                    "task_id":          row[1],
-                    "agent_name":       row[2],
-                    "task_description": row[3],
-                    "status":           row[4],
+                enq = row[6]
+                sid = row[0]
+                if sid not in agent_tasks_result:
+                    agent_tasks_result[sid] = {"developer_key": row[1], "tasks": []}
+                agent_tasks_result[sid]["tasks"].append({
+                    "task_id":          row[2],
+                    "agent_name":       row[3],
+                    "task_description": row[4],
+                    "status":           row[5],
                     "enqueued_at":      enq.isoformat() if hasattr(enq, "isoformat") else enq,
                 })
 

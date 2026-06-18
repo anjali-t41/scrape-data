@@ -65,7 +65,15 @@ Both scripts also read `POSTGRES_URL` from the environment:
 ```bash
 export POSTGRES_URL=postgresql://user:pass@host:5432/db
 python push.py --since 7d
+
+# Single week (most recent with data, auto-detected):
+python batch_runner.py --from-store $POSTGRES_URL --report
+
+# Specific week:
 python batch_runner.py --from-store $POSTGRES_URL --week 2026-W24 --report
+
+# All weeks in the last 90 days:
+python batch_runner.py --from-store $POSTGRES_URL --since 90d --all-weeks --report
 ```
 
 ### Backfill prompts for historical turns
@@ -92,8 +100,9 @@ python backfill_prompts.py $POSTGRES_URL
 
 | Flag | Default | Description |
 |---|---|---|
-| `--since` | `7d` | Period to analyse |
-| `--week` | current ISO week | Score a specific week (e.g. `2026-W24`) |
+| `--since` | `7d` (or `365d` with `--all-weeks`) | Period to analyse |
+| `--week` | most recent week with data | Score a specific week (e.g. `2026-W24`) |
+| `--all-weeks` | off | Score every distinct week found in the data |
 | `--team-size` | auto | Total developer count for adoption % |
 | `--from-store` | — | Read from central store instead of local files |
 | `--report` | off | Print human-readable report to stdout |

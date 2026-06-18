@@ -43,6 +43,29 @@ def _git_identity(cwd: str | None = None) -> tuple[str | None, str | None]:
     return name, email
 
 
+def _decode_project_path(dir_name: str) -> str | None:
+    """
+    Reconstruct a filesystem path from Claude Code's encoded project directory name.
+
+    Linux/macOS: -home-kalpaj-Documents-foo  → /home/kalpaj/Documents/foo
+    Windows    : -C--Users-kalpaj-foo        → C:\\Users\\kalpaj\\foo
+                 (Claude encodes C:\\ as -C- and \\ as -)
+    """
+    if not dir_name.startswith("-"):
+        return None
+
+    # Windows: encoded path starts with a drive letter pattern like -C- or -D-
+    import re
+    win_match = re.match(r"^-([A-Za-z])-(.+)$", dir_name)
+    if win_match and os.name == "nt":
+        drive = win_match.group(1).upper()
+        rest  = win_match.group(2).replace("-", "\\")
+        return f"{drive}:\\{rest}"
+
+    # Unix: leading - becomes /, remaining - become /
+    return "/" + dir_name[1:].replace("-", "/")
+
+
 def _read_claude_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text())
@@ -62,10 +85,8 @@ def _developer_key_from_dir(claude_dir: Path) -> tuple[str, str | None, str | No
     if projects_dir.exists():
         for project_subdir in projects_dir.iterdir():
             if project_subdir.is_dir():
-                # Reconstruct filesystem path from encoded dir name
-                # e.g. -home-kalpaj-Documents-Think41-foo → /home/kalpaj/Documents/Think41/foo
-                candidate = "/" + str(project_subdir.name).replace("-", "/", 1).lstrip("/")
-                n, e = _git_identity(candidate if Path(candidate).exists() else None)
+                candidate = _decode_project_path(project_subdir.name)
+                n, e = _git_identity(candidate if candidate and Path(candidate).exists() else None)
                 if e:
                     name, email = n, e
                     break
@@ -81,12 +102,23 @@ def _developer_key_from_dir(claude_dir: Path) -> tuple[str, str | None, str | No
 
 
 def find_claude_dirs(home: Path | None = None) -> list[Path]:
-    """Return all .claude* directories under the user's home directory."""
+    """Return all claude data directories for the current user (cross-platform)."""
     base = home or Path.home()
     dirs = []
+
+    # Linux / macOS: ~/.claude, ~/.claude-work, ~/.claude-personal, etc.
     for entry in base.iterdir():
         if entry.name.startswith(".claude") and entry.is_dir():
             dirs.append(entry)
+
+    # Windows: %APPDATA%\Claude  (Electron default for Claude Code)
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            win_dir = Path(appdata) / "Claude"
+            if win_dir.is_dir() and win_dir not in dirs:
+                dirs.append(win_dir)
+
     return sorted(dirs)
 
 

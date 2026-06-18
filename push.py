@@ -3,12 +3,13 @@
 Per-machine push script.
 
 Runs on each developer's machine. Collects raw data from local ~/.claude* dirs
-and pushes it to the central SQLite store. Does NOT compute any metrics.
+and pushes it to the central store using bulk inserts. Does NOT compute metrics.
 
 Usage:
-  python push.py --central /shared/drive/central.db
-  python push.py --central /shared/drive/central.db --since 7d
-  python push.py --central /shared/drive/central.db --dry-run
+  python push.py --central postgresql://user:pass@host:5432/db
+  python push.py --central postgresql://user:pass@host:5432/db --since 90d
+  python push.py --central postgresql://user:pass@host:5432/db --force
+  python push.py --central postgresql://user:pass@host:5432/db --dry-run
 """
 
 import argparse
@@ -30,46 +31,65 @@ def _parse_since(s: str) -> datetime:
     return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
 
-def push(central_db, since: datetime, dry_run: bool) -> None:
+def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     store = CentralStore(central_db)
 
-    print(f"[push] Connecting to central store: {central_db}")
-    print(f"[push] Period: since {since.date().isoformat()}")
-    print(f"[push] Current store: {store.stats()}")
+    stats_before = store.stats()
+    print(f"[push] Connecting to central store")
+    print(f"[push] Period  : since {since.date().isoformat()}")
+    print(f"[push] Mode    : {'FORCE (ignoring existing)' if force else 'incremental'}")
+    print(f"[push] DB state before push:")
+    for k, v in stats_before.items():
+        if k != "backend":
+            print(f"         {k:<20} {v:>6} rows")
 
-    # Discover local .claude* dirs
+    # Discover local .claude* dirs and register developers
     developer_map = discover.build_developer_map()
-    print(f"[push] Found {len(developer_map)} local developer account(s)")
+    dev_dirs = [d for dev in developer_map for d in dev["claude_dirs"]]
+    print(f"\n[push] Found {len(developer_map)} developer(s) across {len(dev_dirs)} account(s):")
+    for dev in developer_map:
+        print(f"         {dev.get('name') or 'unknown'} <{dev.get('email') or 'no email'}>")
+        for d in dev["claude_dirs"]:
+            print(f"           {d}")
 
-    # Already-pushed sessions — skip them for incremental push
-    already_pushed = store.pushed_session_ids()
-    print(f"[push] {len(already_pushed)} sessions already in store (will skip)")
+    if not dry_run:
+        store.upsert_developers(developer_map)
 
-    # Collect raw data locally
-    print("[push] Collecting session metadata...")
+    # Determine which sessions to skip
+    already_sm  = set() if force else store.pushed_session_ids()
+    already_te  = set() if force else store.pushed_turn_session_ids()
+    already_at  = set() if force else store.pushed_agent_session_ids()
+
+    print(f"\n[push] Skipping: {len(already_sm)} session_metas, "
+          f"{len(already_te)} turn-event sessions, "
+          f"{len(already_at)} agent-task sessions already in store")
+
+    # ── Collect ──────────────────────────────────────────────────────────────
+    print("\n[push] Collecting session metadata...")
     raw_session_metas = session_meta.collect(developer_map, since=since)
-    new_metas = [m for m in raw_session_metas if m["session_id"] not in already_pushed]
-    print(f"[push]   {len(raw_session_metas)} total sessions, {len(new_metas)} new")
+    new_metas = [m for m in raw_session_metas if m["session_id"] not in already_sm]
+    print(f"         {len(raw_session_metas)} found, {len(new_metas)} new")
 
-    print("[push] Parsing JSONL transcripts for new sessions...")
+    print("[push] Parsing JSONL transcripts...")
     raw_turn_events = sessions.collect(
         developer_map,
-        processed_sessions=already_pushed,
+        processed_sessions=already_te,
         since=since,
     )
-    print(f"[push]   {len(raw_turn_events)} turn events")
+    new_te_sessions = len({e["session_id"] for e in raw_turn_events})
+    print(f"         {len(raw_turn_events)} turn events across {new_te_sessions} new sessions")
 
     print("[push] Collecting facets, app state, plans, agent tasks...")
-    raw_facets       = facets.collect(developer_map)
-    raw_app_state    = app_state.collect(developer_map)
-    raw_plans        = plans.collect(developer_map)
-    already_at       = store.pushed_agent_session_ids()
-    raw_agent_tasks  = agent_tasks.collect(developer_map, processed_sessions=already_at, since=since)
+    raw_facets      = facets.collect(developer_map)
+    raw_app_state   = app_state.collect(developer_map)
+    raw_plans       = plans.collect(developer_map)
+    raw_agent_tasks = agent_tasks.collect(developer_map, processed_sessions=already_at, since=since)
     plugins.collect(developer_map)
     settings.collect(developer_map)
 
     task_count = sum(len(v.get("tasks", [])) for v in raw_agent_tasks.values())
-    print(f"[push]   {len(raw_agent_tasks)} sessions with agent activity, {task_count} tasks")
+    print(f"         {len(raw_facets)} facets, {len(raw_app_state)} app states, "
+          f"{len(raw_agent_tasks)} agent sessions ({task_count} tasks)")
 
     raw = {
         "session_metas": new_metas,
@@ -80,37 +100,53 @@ def push(central_db, since: datetime, dry_run: bool) -> None:
         "agent_tasks":   raw_agent_tasks,
     }
 
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n[push] To be pushed:")
+    print(f"         session_metas  : {len(new_metas)}")
+    print(f"         turn_events    : {len(raw_turn_events)}")
+    print(f"         facets         : {len(raw_facets)}")
+    print(f"         app_state      : {len(raw_app_state)}")
+    print(f"         plans          : {len(raw_plans)}")
+    print(f"         agent_tasks    : {task_count}")
+
     if dry_run:
-        print(f"[push] DRY RUN — would push:")
-        print(f"  session_metas : {len(new_metas)}")
-        print(f"  turn_events   : {len(raw_turn_events)}")
-        print(f"  facets        : {len(raw_facets)}")
-        print(f"  app_state     : {len(raw_app_state)}")
-        print(f"  plans         : {len(raw_plans)}")
+        print("\n[push] DRY RUN — nothing written.")
         store.close()
         return
 
-    inserted = store.push(raw)
+    # ── Push ─────────────────────────────────────────────────────────────────
+    inserted = store.push(raw, force=force)
     store.close()
 
-    print("[push] Done.")
-    print(f"  session_metas inserted : {inserted['session_metas']}")
-    print(f"  turn_events inserted   : {inserted['turn_events']}")
-    print(f"  facets inserted        : {inserted['facets']}")
-    print(f"  app_state upserted     : {inserted['app_state']}")
-    print(f"  plans upserted         : {inserted['plans']}")
-    print(f"  agent_tasks inserted   : {inserted['agent_tasks']}")
+    stats_delta = {
+        "session_metas": inserted["session_metas"],
+        "turn_events":   inserted["turn_events"],
+        "facets":        inserted["facets"],
+        "app_state":     inserted["app_state"],
+        "plans":         inserted["plans"],
+        "agent_tasks":   inserted["agent_tasks"],
+    }
+
+    print("\n[push] Done.")
+    print(f"  {'Table':<22} {'Before':>8} {'Inserted':>10} {'After':>8}")
+    print("  " + "-" * 52)
+    for k, before in stats_before.items():
+        if k in stats_delta:
+            after = before + stats_delta[k]
+            print(f"  {k:<22} {before:>8} {stats_delta[k]:>10} {after:>8}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Push local Claude data to central store")
     parser.add_argument("--central", default=None,
                         help="SQLite path or PostgreSQL URL. "
-                             "Defaults to POSTGRES_URL env var if set, else local SQLite.")
+                             "Defaults to POSTGRES_URL env var if set.")
     parser.add_argument("--since", default="7d",
-                        help="Collect sessions since this period (default: 7d)")
+                        help="Collect sessions since this period, e.g. 7d, 30d, 90d (default: 7d)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-push all data, ignoring what is already in the store")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be pushed without writing")
+                        help="Show what would be pushed without writing anything")
     args = parser.parse_args()
 
     target = args.central or os.environ.get("POSTGRES_URL")
@@ -122,6 +158,7 @@ def main():
         central_db=target,
         since=_parse_since(args.since),
         dry_run=args.dry_run,
+        force=args.force,
     )
 
 

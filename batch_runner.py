@@ -8,6 +8,9 @@ Single-machine mode (default):
 Distributed mode — read from central store instead of local files:
   python batch_runner.py --from-store /shared/central.db --since 7d --report
 
+All-weeks mode (score every week found in the data):
+  python batch_runner.py --from-store $POSTGRES_URL --since 90d --all-weeks --report
+
 Other options:
   --output /tmp/out.json   custom output path
   --team-size 15           total developer count for adoption %
@@ -116,7 +119,7 @@ def _compute(raw: dict, team_size: int | None, week: str, store: MetricsStore) -
     metrics = {
         "adoption":        adoption.compute(sessions_by_dev, total_developers=team_size),
         "agent_hours":     hours,
-        "parallel_agents": parallel_agents.compute(te, meta_by_sid),
+        "parallel_agents": parallel_agents.compute(te, meta_by_sid, raw.get("agent_tasks", {})),
         "depth":           depth.compute(sessions_by_dev),
         "harness":         harness.compute(sessions_by_dev, raw["plans"], raw["app_state"]),
         "skills":          skills.compute(skill_events),
@@ -134,19 +137,24 @@ def _compute(raw: dict, team_size: int | None, week: str, store: MetricsStore) -
     return metrics, dict(sessions_by_dev)
 
 
-def run(
-    since: datetime,
-    team_size: int | None,
-    target_week: str | None,
-    output_path: Path | None,
-    daily_only: bool,
-    store: MetricsStore,
-    central_db: Path | None = None,
-) -> dict:
-    week = target_week or _current_week()
+def _all_weeks_in_data(session_metas: list) -> list[str]:
+    """Return sorted list of distinct ISO weeks present in session_metas."""
+    weeks: set[str] = set()
+    for s in session_metas:
+        ts = s.get("start_time")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                iso = dt.isocalendar()
+                weeks.add(f"{iso.year}-W{iso.week:02d}")
+            except Exception:
+                pass
+    return sorted(weeks)
 
+
+def _pull_raw(since: datetime, store: MetricsStore, daily_only: bool, central_db) -> tuple[dict, dict]:
+    """Return (raw, dev_name_map). Shared by run() and run_all_weeks()."""
     if central_db:
-        # ── Distributed mode: raw data comes from central store ───────────
         print(f"[batch] Reading from central store: {central_db}")
         print(f"[batch] Period: since {since.date().isoformat()}")
         cs = CentralStore(central_db)
@@ -154,19 +162,20 @@ def run(
         cs.close()
         print(f"[batch]   {len(raw['session_metas'])} sessions, "
               f"{len(raw['turn_events'])} turn events from store")
-        dev_name_map = {}  # names not in DB — fall back to key prefix
+        return raw, {}
     else:
-        # ── Single-machine mode: collect locally ──────────────────────────
         print(f"[batch] Starting {'daily' if daily_only else 'weekly'} run")
         print(f"[batch] Period: since {since.date().isoformat()}")
         developer_map = discover.build_developer_map()
         print(f"[batch]   Found {len(developer_map)} developer(s)")
-        store.upsert_developers(developer_map)
         raw = _collect(developer_map, since, store, daily_only)
         dev_name_map = {d["developer_key"]: d.get("name") or d["developer_key"][:12]
                         for d in developer_map}
+        return raw, dev_name_map
 
-    metrics, sessions_by_dev = _compute(raw, team_size, week, store)
+
+def _score_week(week: str, metrics: dict, sessions_by_dev: dict, dev_name_map: dict, store: MetricsStore) -> dict:
+    """Compute per-developer and team composite scores for one ISO week."""
     developer_scores = []
     for key in sessions_by_dev:
         score = composite.compute(
@@ -187,7 +196,6 @@ def run(
         score["agent_hours_status"] = metrics["agent_hours"].get(key, {}).get("by_week", {}).get(week, {}).get("status", "unknown")
         developer_scores.append(score)
 
-    # Equity needs final developer_scores for Gini — compute it now
     equity_data = equity.compute(
         developer_scores    = developer_scores,
         agent_hours_results = metrics["agent_hours"],
@@ -196,18 +204,43 @@ def run(
     )
     team_score = composite.team_composite(developer_scores, equity_data=equity_data)
 
+    return {
+        "week": week,
+        "team": {
+            **team_score,
+            "adoption":    metrics["adoption"]["team"],
+            "agent_hours": agent_hours.team_summary(metrics["agent_hours"], week),
+            "velocity":    velocity.team_summary(metrics["velocity"]),
+            "skills":      skills.team_summary(metrics["skills"], week),
+        },
+        "developers": sorted(developer_scores, key=lambda d: d["ai_native_score"], reverse=True),
+    }
+
+
+def run(
+    since: datetime,
+    team_size: int | None,
+    target_week: str | None,
+    output_path: Path | None,
+    daily_only: bool,
+    store: MetricsStore,
+    central_db: Path | None = None,
+) -> dict:
+    raw, dev_name_map = _pull_raw(since, store, daily_only, central_db)
+    if target_week:
+        week = target_week
+    else:
+        weeks_found = _all_weeks_in_data(raw["session_metas"])
+        week = weeks_found[-1] if weeks_found else _current_week()
+        print(f"[batch] No --week specified; using most recent week with data: {week}")
+
+    metrics, sessions_by_dev = _compute(raw, team_size, week, store)
+    weekly_payload = _score_week(week, metrics, sessions_by_dev, dev_name_map, store)
+
     payload = {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "period_since": since.isoformat(),
-        "week":         week,
-        "team": {
-            **team_score,
-            "adoption":   metrics["adoption"]["team"],
-            "agent_hours": agent_hours.team_summary(metrics["agent_hours"], week),
-            "velocity":   velocity.team_summary(metrics["velocity"]),
-            "skills":     skills.team_summary(metrics["skills"], week),
-        },
-        "developers": sorted(developer_scores, key=lambda d: d["ai_native_score"], reverse=True),
+        **weekly_payload,
         "raw": {
             "session_count": len(raw["session_metas"]),
             "turn_events":   len(raw["turn_events"]),
@@ -216,12 +249,56 @@ def run(
     }
 
     out_path = store.write_output(payload, output_path)
-    store.append_weekly_snapshot({"week": week, "team_score": team_score.get("team_ai_native_score")})
+    store.append_weekly_snapshot({"week": week, "team_score": payload["team"].get("team_ai_native_score")})
     store.mark_run_complete("daily" if daily_only else "weekly")
 
     print(f"[batch] Done. Output → {out_path}")
-    print(f"[batch] Team AI Native Score: {team_score.get('team_ai_native_score')} ({team_score.get('label')})")
+    print(f"[batch] Team AI Native Score: {payload['team'].get('team_ai_native_score')} ({payload['team'].get('label')})")
     return payload
+
+
+def run_all_weeks(
+    since: datetime,
+    team_size: int | None,
+    output_path: Path | None,
+    store: MetricsStore,
+    central_db: Path | None = None,
+) -> list[dict]:
+    """Compute metrics for every distinct week present in the pulled data."""
+    raw, dev_name_map = _pull_raw(since, store, daily_only=False, central_db=central_db)
+
+    weeks = _all_weeks_in_data(raw["session_metas"])
+    if not weeks:
+        print("[batch] No sessions found in the specified period.")
+        return []
+
+    print(f"[batch] Found {len(weeks)} week(s): {', '.join(weeks)}")
+
+    # Run computers once — they produce by_week breakdowns internally
+    metrics, sessions_by_dev = _compute(raw, team_size, weeks[-1], store)
+
+    week_payloads: list[dict] = []
+    for week in weeks:
+        wp = _score_week(week, metrics, sessions_by_dev, dev_name_map, store)
+        week_payloads.append(wp)
+        store.append_weekly_snapshot({"week": week, "team_score": wp["team"].get("team_ai_native_score")})
+        print(f"[batch]   {week}: score {wp['team'].get('team_ai_native_score')} ({wp['team'].get('label')})")
+
+    full_output = {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "period_since": since.isoformat(),
+        "weeks": week_payloads,
+        "raw": {
+            "session_count": len(raw["session_metas"]),
+            "turn_events":   len(raw["turn_events"]),
+            "facet_count":   len(raw["facets"]),
+        },
+    }
+
+    out_path = store.write_output(full_output, output_path)
+    store.mark_run_complete("weekly")
+    print(f"[batch] Done. Output → {out_path}")
+    return week_payloads
 
 
 def print_report(payload: dict) -> None:
@@ -248,10 +325,39 @@ def print_report(payload: dict) -> None:
     print()
 
 
+def print_all_weeks_report(week_payloads: list[dict]) -> None:
+    if not week_payloads:
+        print("\n[batch] No data to report.\n")
+        return
+
+    print()
+    print("=" * 62)
+    print("  AI NATIVENESS REPORT — ALL WEEKS")
+    print("=" * 62)
+    print(f"  {'Week':<12} {'Score':>6}  {'Label':<15} {'AvgAgentHrs':>12}")
+    print("  " + "-" * 50)
+    for wp in week_payloads:
+        team = wp.get("team", {})
+        print(
+            f"  {wp.get('week',''):<12} "
+            f"{team.get('team_ai_native_score', 0.0):>6.1f}  "
+            f"{team.get('label', ''):<15} "
+            f"{team.get('agent_hours', {}).get('avg_agent_hours', 0.0):>11.1f}h"
+        )
+    print("=" * 62)
+    print()
+
+    for wp in week_payloads:
+        print_report(wp)
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Nativeness Metrics Batch Runner")
-    parser.add_argument("--since", default="7d", help="Period to analyse, e.g. 7d, 30d (default: 7d)")
+    parser.add_argument("--since", default=None,
+                        help="Period to analyse, e.g. 7d, 30d (default: 7d; 365d when --all-weeks)")
     parser.add_argument("--week", default=None, help="ISO week to score, e.g. 2026-W25")
+    parser.add_argument("--all-weeks", action="store_true",
+                        help="Score every week found in the data (overrides --week)")
     parser.add_argument("--team-size", type=int, default=None, help="Total developer count for adoption pct")
     parser.add_argument("--output", type=Path, default=None, help="Custom output JSON path")
     parser.add_argument("--store-dir", type=Path, default=None, help="Metrics store directory")
@@ -263,22 +369,33 @@ def main():
     args = parser.parse_args()
 
     import os
-    since      = _parse_since(args.since)
+    default_since = "365d" if args.all_weeks else "7d"
+    since      = _parse_since(args.since or default_since)
     store      = MetricsStore(store_dir=args.store_dir)
     central_db = args.from_store or os.environ.get("POSTGRES_URL")
 
-    payload = run(
-        since=since,
-        team_size=args.team_size,
-        target_week=args.week,
-        output_path=args.output,
-        daily_only=args.daily,
-        store=store,
-        central_db=central_db,
-    )
-
-    if args.report:
-        print_report(payload)
+    if args.all_weeks:
+        week_payloads = run_all_weeks(
+            since=since,
+            team_size=args.team_size,
+            output_path=args.output,
+            store=store,
+            central_db=central_db,
+        )
+        if args.report:
+            print_all_weeks_report(week_payloads)
+    else:
+        payload = run(
+            since=since,
+            team_size=args.team_size,
+            target_week=args.week,
+            output_path=args.output,
+            daily_only=args.daily,
+            store=store,
+            central_db=central_db,
+        )
+        if args.report:
+            print_report(payload)
 
 
 if __name__ == "__main__":

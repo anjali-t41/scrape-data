@@ -54,11 +54,16 @@ def _parse_queue_content(content: str) -> dict:
         summary_text = m.group(1).strip()
         am = _SUMMARY_RE.search(summary_text)
         if am:
+            # Format: Agent "name: description" completed
             label = am.group(1)
             if ": " in label:
                 agent_name, task_description = label.split(": ", 1)
             else:
                 agent_name = label
+        else:
+            # Summary present but doesn't follow Agent "..." format —
+            # keep it as task_description; agent_name resolved from agent-name msg later.
+            task_description = summary_text
 
     return {
         "task_id":          task_id or None,
@@ -81,6 +86,8 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
     session_id = path.stem
     ai_title: str | None = None
     agent_names_seen: list[str] = []
+    agent_name_ts: dict[str, str] = {}  # name → timestamp from agent-name message
+    session_start_ts: str | None = None
     tasks: list[dict] = []
 
     for line in lines:
@@ -95,6 +102,10 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
         mtype = msg.get("type", "")
         session_id = session_id or msg.get("sessionId", path.stem)
 
+        ts_msg = msg.get("timestamp", "")
+        if ts_msg and not session_start_ts:
+            session_start_ts = ts_msg
+
         if mtype == "ai-title":
             title = msg.get("aiTitle", "").strip()
             if title:
@@ -104,6 +115,8 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
             name = msg.get("agentName", "").strip()
             if name and name not in agent_names_seen:
                 agent_names_seen.append(name)
+                if ts_msg:
+                    agent_name_ts[name] = ts_msg
 
         elif mtype == "queue-operation" and msg.get("operation") == "enqueue":
             content = msg.get("content", "")
@@ -116,20 +129,31 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
                 "enqueued_at": ts_raw or None,
                 "week":        _week_label(ts_dt) if ts_dt else None,
             })
-            if parsed.get("agent_name") or parsed.get("task_id"):
+            # Only insert if we have an agent name — a task_id alone is not useful
+            if parsed.get("agent_name"):
                 tasks.append(parsed)
 
-    # Include agent-name-only entries not already captured by queue-operation records
+    # Agent-name-only entries: agents seen via agent-name msg but not via queue-operation.
+    # Use the agent-name message timestamp so week/enqueued_at are never NULL.
     task_names = {t["agent_name"] for t in tasks if t.get("agent_name")}
     for name in agent_names_seen:
         if name not in task_names:
+            ts_raw = agent_name_ts.get(name) or session_start_ts
+            if not ts_raw:
+                # Last resort: file mtime
+                try:
+                    dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                    ts_raw = dt.isoformat()
+                except Exception:
+                    pass
+            ts_dt = _parse_iso(ts_raw) if ts_raw else None
             tasks.append({
                 "task_id":          None,
                 "agent_name":       name,
                 "task_description": None,
                 "status":           None,
-                "enqueued_at":      None,
-                "week":             None,
+                "enqueued_at":      ts_raw or None,
+                "week":             _week_label(ts_dt) if ts_dt else None,
             })
 
     if not ai_title and not agent_names_seen and not tasks:

@@ -16,6 +16,7 @@ from datetime import datetime
 def compute(
     turn_events: list[dict],
     meta_by_sid: dict[str, dict],
+    agent_tasks: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     """
     Return {developer_key: {
@@ -26,6 +27,7 @@ def compute(
         by_week: {week: {...}}
     }}
     meta_by_sid: pre-built {session_id: session_meta} index.
+    agent_tasks: {session_id: {developer_key, tasks, ...}} from agent_tasks collector.
     """
     # Per session: max agent colors, has sidechain, uses_task_agent
     session_colors: dict[str, int] = {}
@@ -43,6 +45,13 @@ def compute(
         if event.get("is_sidechain"):
             session_sidechain[sid] += 1
 
+    # Pull developer_key and session_id from agent_tasks for sessions not in turn_events
+    agent_tasks = agent_tasks or {}
+    for sid, at in agent_tasks.items():
+        key = at.get("developer_key", "")
+        if key and sid not in session_dev:
+            session_dev[sid] = key
+
     dev_sessions: dict[str, list[dict]] = defaultdict(list)
     all_session_ids = set(session_dev.keys()) | set(meta_by_sid.keys())
 
@@ -55,7 +64,9 @@ def compute(
         colors = session_colors.get(sid, 0)
         sidechain_turns = session_sidechain.get(sid, 0)
         uses_task = meta.get("uses_task_agent", False)
-        is_agentive = colors > 1 or uses_task or sidechain_turns > 0
+        # Also treat sessions with recorded agent tasks as agentive
+        has_agent_tasks = bool(agent_tasks.get(sid, {}).get("tasks"))
+        is_agentive = colors > 1 or uses_task or sidechain_turns > 0 or has_agent_tasks
 
         dev_sessions[dev_key].append({
             "session_id": sid,
