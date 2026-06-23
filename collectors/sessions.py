@@ -244,6 +244,9 @@ def _too_old(path: Path, since: datetime) -> bool:
         return False
 
 
+_WF_SKIP_STEMS = {"journal", "history"}
+
+
 def collect_segments(
     developer_map: list[dict],
     since: datetime | None = None,
@@ -251,8 +254,17 @@ def collect_segments(
     """
     Busy segments across all claude dirs — primary source for agent hours.
 
-    Includes sub-agent transcripts under <session>/subagents/agent-*.jsonl
-    (tagged is_sidechain=True), which the per-turn collect() does not read.
+    Three sources, all tagged is_sidechain appropriately:
+      1. Main session files:  <project>/<session>.jsonl          is_sidechain=False
+      2. Agent tool sub-agents: <project>/<session>/subagents/agent-*.jsonl
+                                                                  is_sidechain=True
+      3. Workflow tool sub-agents:
+           <project>/<session>/subagents/workflows/<run-id>/<agent>.jsonl
+                                                                  is_sidechain=True
+         Workflow sub-agents do NOT inject isSidechain entries into the parent
+         session JSONL (unlike Agent tool calls), so their execution windows would
+         be invisible to the pipeline without this explicit scan.
+         journal.jsonl and history.jsonl inside workflow run dirs are skipped.
     """
     all_segs: list[dict] = []
     for dev in developer_map:
@@ -264,21 +276,38 @@ def collect_segments(
             for project_dir in projects_dir.iterdir():
                 if not project_dir.is_dir():
                     continue
-                # main session files
+
+                # 1. Main session files
                 for jsonl_file in project_dir.glob("*.jsonl"):
                     if since and _too_old(jsonl_file, since):
                         continue
                     all_segs.extend(
                         _segments_from_jsonl(jsonl_file, key, jsonl_file.stem, False)
                     )
-                # sub-agent files: <session>/subagents/agent-*.jsonl
-                for sub_file in project_dir.glob("**/subagents/*.jsonl"):
+
+                # 2. Agent tool sub-agents: <session>/subagents/<agent>.jsonl
+                #    (**/subagents/*.jsonl matches only one level inside subagents/)
+                for sub_file in project_dir.glob("*/subagents/*.jsonl"):
                     if since and _too_old(sub_file, since):
                         continue
                     parent_session = sub_file.parent.parent.name
                     all_segs.extend(
                         _segments_from_jsonl(sub_file, key, parent_session, True)
                     )
+
+                # 3. Workflow tool sub-agents:
+                #    <session>/subagents/workflows/<run-id>/<agent>.jsonl
+                for wf_file in project_dir.glob("*/subagents/workflows/*/*.jsonl"):
+                    if wf_file.stem in _WF_SKIP_STEMS:
+                        continue
+                    if since and _too_old(wf_file, since):
+                        continue
+                    # wf_file.parents: [run-dir, workflows/, subagents/, session-dir, project-dir]
+                    parent_session = wf_file.parents[3].name
+                    all_segs.extend(
+                        _segments_from_jsonl(wf_file, key, parent_session, True)
+                    )
+
     return all_segs
 
 

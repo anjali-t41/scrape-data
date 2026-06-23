@@ -187,10 +187,11 @@ def _pull_raw(since: datetime, store: MetricsStore, daily_only: bool, central_db
         logger.info(f"[batch] Period: since {since.date().isoformat()}")
         cs = CentralStore(central_db)
         raw = cs.pull_raw(since=since)
+        dev_name_map = cs.developer_names()
         cs.close()
         logger.info(f"[batch]   {len(raw['session_metas'])} sessions, "
                     f"{len(raw['turn_events'])} turn events from store")
-        return raw, {}
+        return raw, dev_name_map
     else:
         logger.info(f"[batch] Starting {'daily' if daily_only else 'weekly'} run")
         logger.info(f"[batch] Period: since {since.date().isoformat()}")
@@ -330,11 +331,17 @@ def print_report(payload: dict) -> None:
     logger.info(f"  Team Velocity       {team.get('velocity',{}).get('team_velocity',0):>6.0f}  lines / agent hour")
     logger.info(f"  Skill Invocations   {team.get('skills',{}).get('total_invocations',0):>6}")
     logger.info("")
-    logger.info(f"  {'Developer':<20} {'Score':>6} {'AgentHrs':>9} {'Status':<15}")
-    logger.info("  " + "-" * 54)
+    logger.info(f"  {'Developer':<18} {'Team (org/project)':<34} {'Score':>6} {'AgentHrs':>9} {'Status':<13}")
+    logger.info("  " + "-" * 86)
     for d in devs:
         flag = " ← needs attention" if d.get("agent_hours_status") == "stuck" else ""
-        logger.info(f"  {str(d.get('name','?')):<20} {d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h  {d.get('agent_hours_status',''):<15}{flag}")
+        name = (str(d.get("name") or "unknown"))[:17]
+        team = (str(d.get("team") or "unknown"))[:33]
+        logger.info(
+            f"  {name:<18} {team:<34} "
+            f"{d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h  "
+            f"{d.get('agent_hours_status',''):<13}{flag}"
+        )
     logger.info("=" * 62)
     logger.info("")
 
