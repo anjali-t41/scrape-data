@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from collectors import discover, session_meta, sessions, facets, app_state, plans, plugins, settings, agent_tasks
+from collectors import discover, session_meta, session_index, sessions, facets, app_state, plans, plugins, settings, agent_tasks
 from central_store import CentralStore
 
 
@@ -67,8 +67,13 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     # ── Collect ──────────────────────────────────────────────────────────────
     print("\n[push] Collecting session metadata...")
     raw_session_metas = session_meta.collect(developer_map, since=since)
-    new_metas = [m for m in raw_session_metas if m["session_id"] not in already_sm]
-    print(f"         {len(raw_session_metas)} found, {len(new_metas)} new")
+    # Gap-fill: JSONL-derived sessions telemetry never wrote (subagents excluded).
+    # Telemetry stays authoritative; existing sessions are NOT re-derived.
+    jsonl_sessions = session_index.collect(developer_map, since=since)
+    union_metas = session_index.merge_gap_fill(raw_session_metas, jsonl_sessions)
+    gap = len(union_metas) - len(raw_session_metas)
+    new_metas = [m for m in union_metas if m["session_id"] not in already_sm]
+    print(f"         {len(raw_session_metas)} telemetry + {gap} JSONL gap-fill, {len(new_metas)} new")
 
     print("[push] Parsing JSONL transcripts...")
     raw_turn_events = sessions.collect(
@@ -78,6 +83,11 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     )
     new_te_sessions = len({e["session_id"] for e in raw_turn_events})
     print(f"         {len(raw_turn_events)} turn events across {new_te_sessions} new sessions")
+
+    print("[push] Building busy segments (accurate agent hours)...")
+    raw_busy_segments = sessions.collect_segments(developer_map, since=since)
+    seg_sessions = len({s["session_id"] for s in raw_busy_segments})
+    print(f"         {len(raw_busy_segments)} segments across {seg_sessions} sessions")
 
     print("[push] Collecting facets, app state, plans, agent tasks...")
     raw_facets      = facets.collect(developer_map)
@@ -94,6 +104,7 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     raw = {
         "session_metas": new_metas,
         "turn_events":   raw_turn_events,
+        "busy_segments": raw_busy_segments,
         "facets":        raw_facets,
         "app_state":     raw_app_state,
         "plans":         raw_plans,
@@ -104,6 +115,7 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     print("\n[push] To be pushed:")
     print(f"         session_metas  : {len(new_metas)}")
     print(f"         turn_events    : {len(raw_turn_events)}")
+    print(f"         busy_segments  : {len(raw_busy_segments)}")
     print(f"         facets         : {len(raw_facets)}")
     print(f"         app_state      : {len(raw_app_state)}")
     print(f"         plans          : {len(raw_plans)}")
@@ -119,12 +131,13 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     store.close()
 
     stats_delta = {
-        "session_metas": inserted["session_metas"],
-        "turn_events":   inserted["turn_events"],
-        "facets":        inserted["facets"],
-        "app_state":     inserted["app_state"],
-        "plans":         inserted["plans"],
-        "agent_tasks":   inserted["agent_tasks"],
+        "session_metas": inserted.get("session_metas", 0),
+        "turn_events":   inserted.get("turn_events", 0),
+        "busy_segments": inserted.get("busy_segments", 0),
+        "facets":        inserted.get("facets", 0),
+        "app_state":     inserted.get("app_state", 0),
+        "plans":         inserted.get("plans", 0),
+        "agent_tasks":   inserted.get("agent_tasks", 0),
     }
 
     print("\n[push] Done.")
