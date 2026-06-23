@@ -246,12 +246,45 @@ def _ingest_file(path: Path, dev_key: str, claude_dir: Path, accs: dict[str, _Ac
         acc.add_message(msg)
 
 
-def merge_gap_fill(telemetry: list[dict], jsonl_derived: list[dict]) -> list[dict]:
-    """Union: telemetry records (authoritative) + JSONL records for sessions telemetry lacks.
+# Fields JSONL can't reliably derive — overlay from telemetry where it exists.
+# (Everything else — lines, tools, tokens, duration — comes from JSONL.)
+_TELEMETRY_ENRICH_FIELDS = ("user_interruptions",)
 
-    Avoids re-deriving already-covered sessions, so historical numbers do not step (R2).
-    Telemetry records are tagged source='telemetry' if not already.
+
+def merge_jsonl_primary(jsonl_derived: list[dict], telemetry: list[dict]) -> list[dict]:
+    """JSONL is the source of truth; telemetry only fills gaps.
+
+    - Every real session uses its JSONL-derived record (one consistent methodology,
+      full coverage — usage-data's gaps no longer drop sessions).
+    - For overlapping sessions, a few fields JSONL can't reliably produce
+      (`_TELEMETRY_ENRICH_FIELDS`, e.g. user_interruptions) are overlaid from telemetry
+      only when JSONL's value is empty — strictly additive, never overrides JSONL.
+    - Telemetry-only sessions (usage-data exists but JSONL is gone) are kept as orphans,
+      tagged source='telemetry'.
+
+    Note: this is a one-time cutover vs the old telemetry-primary numbers (R2). Intended.
     """
+    by_tele = {m.get("session_id"): m for m in telemetry}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for j in jsonl_derived:
+        sid = j.get("session_id")
+        seen.add(sid)
+        t = by_tele.get(sid)
+        if t:
+            for f in _TELEMETRY_ENRICH_FIELDS:
+                if not j.get(f) and t.get(f):
+                    j[f] = t[f]
+        out.append(j)
+    for t in telemetry:
+        if t.get("session_id") not in seen:
+            t.setdefault("source", "telemetry")
+            out.append(t)
+    return out
+
+
+def merge_gap_fill(telemetry: list[dict], jsonl_derived: list[dict]) -> list[dict]:
+    """DEPRECATED telemetry-primary union — kept for reference. Use merge_jsonl_primary."""
     out: list[dict] = []
     seen: set[str] = set()
     for m in telemetry:

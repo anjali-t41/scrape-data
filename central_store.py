@@ -309,11 +309,21 @@ class _BaseStore:
             sid = meta.get("session_id")
             if not sid:
                 continue
-            n = self._upsert_ignore(
-                "INSERT INTO session_metas (session_id, developer_key, week, date, pushed_at, data) "
-                "VALUES ({p},{p},{p},{p},{p},{p})",
-                (sid, meta.get("developer_key", ""), meta.get("week"), meta.get("date"), now, _dumps(meta)),
-            )
+            if force:
+                # Refresh existing rows (e.g. cutover to JSONL-primary records).
+                n = self._upsert_replace(
+                    "session_metas",
+                    {"session_id": sid, "developer_key": meta.get("developer_key", ""),
+                     "week": meta.get("week"), "date": meta.get("date"),
+                     "pushed_at": now, "data": _dumps(meta)},
+                    conflict_col="session_id",
+                )
+            else:
+                n = self._upsert_ignore(
+                    "INSERT INTO session_metas (session_id, developer_key, week, date, pushed_at, data) "
+                    "VALUES ({p},{p},{p},{p},{p},{p})",
+                    (sid, meta.get("developer_key", ""), meta.get("week"), meta.get("date"), now, _dumps(meta)),
+                )
             inserted["session_metas"] += n
 
         turns_by_session: dict[str, list] = {}

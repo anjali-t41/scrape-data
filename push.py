@@ -67,13 +67,14 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     # ── Collect ──────────────────────────────────────────────────────────────
     print("\n[push] Collecting session metadata...")
     raw_session_metas = session_meta.collect(developer_map, since=since)
-    # Gap-fill: JSONL-derived sessions telemetry never wrote (subagents excluded).
-    # Telemetry stays authoritative; existing sessions are NOT re-derived.
+    # JSONL is the source of truth (usage-data has coverage gaps); telemetry only fills
+    # orphan sessions + fields JSONL can't derive. Re-push with --force to refresh the
+    # sessions already stored under the old telemetry-primary scheme.
     jsonl_sessions = session_index.collect(developer_map, since=since)
-    union_metas = session_index.merge_gap_fill(raw_session_metas, jsonl_sessions)
-    gap = len(union_metas) - len(raw_session_metas)
+    union_metas = session_index.merge_jsonl_primary(jsonl_sessions, raw_session_metas)
     new_metas = [m for m in union_metas if m["session_id"] not in already_sm]
-    print(f"         {len(raw_session_metas)} telemetry + {gap} JSONL gap-fill, {len(new_metas)} new")
+    print(f"         {len(jsonl_sessions)} JSONL (primary), {len(raw_session_metas)} telemetry, "
+          f"{len(union_metas)} union, {len(new_metas)} new")
 
     print("[push] Parsing JSONL transcripts...")
     raw_turn_events = sessions.collect(

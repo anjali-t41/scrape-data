@@ -1,11 +1,18 @@
 # Plan — JSONL-Derived Session Index (session-meta becomes enrichment, not source of truth)
 
-> Status: **IMPLEMENTED (gap-fill variant).** Built `collectors/session_index.py` +
-> `merge_gap_fill`, wired into `batch_runner._collect` and `push.py`. Chose the **gap-fill union**
-> over a source-switch to neutralize R2 — telemetry stays authoritative, JSONL only fills missing
-> sessions. Verified: 18 telemetry + 24 JSONL = 42 sessions; 14 overlapping sessions 0 re-derived;
-> subagents excluded (38 real, not 106). Remaining: re-push central.db to persist; Postgres parity;
-> R5 sub-agent line undercount accepted/documented.
+> Status: **IMPLEMENTED — JSONL-primary.** Built `collectors/session_index.py` +
+> `merge_jsonl_primary`, wired into `batch_runner._collect` and `push.py`; `session_metas` push is
+> force-aware (REPLACE on `--force`) so cutover refreshes existing rows.
+>
+> **JSONL is the source of truth** (usage-data has clear coverage gaps). Every real session uses its
+> JSONL-derived record (one consistent methodology); telemetry only fills orphan sessions (usage-data
+> exists but JSONL gone) + fields JSONL can't derive (`user_interruptions`). This is a deliberate
+> one-time cutover vs the old telemetry numbers (R2 accepted, not avoided).
+>
+> Verified on sample data: 38 JSONL-primary + 4 telemetry orphans = 42; all 14 overlapping sessions
+> now JSONL-sourced; 6 enriched with telemetry interruptions; subagents excluded (38 real, not 106);
+> central.db force-repushed to JSONL-primary. Remaining: Postgres parity; R5 sub-agent line undercount
+> documented. `merge_gap_fill` kept (deprecated) for reference.
 
 ## Context
 

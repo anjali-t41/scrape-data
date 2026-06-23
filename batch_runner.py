@@ -75,13 +75,15 @@ def _collect(developer_map: list[dict], since: datetime, store: MetricsStore, da
               f"{sum(len(v.get('tasks',[])) for v in raw_agent_tasks.values())} agent tasks extracted")
         store.mark_sessions_processed(list({e["session_id"] for e in raw_turn_events}))
 
-        # Gap-fill: add JSONL-derived sessions telemetry never wrote (subagents excluded).
-        # Telemetry stays authoritative where present — existing sessions are NOT re-derived.
+        # JSONL is the source of truth (usage-data has clear coverage gaps). Telemetry
+        # only fills orphan sessions + a few fields JSONL can't derive (user_interruptions).
         jsonl_sessions = session_index.collect(developer_map, since=since)
-        before = len(raw_session_metas)
-        raw_session_metas = session_index.merge_gap_fill(raw_session_metas, jsonl_sessions)
-        print(f"[batch]   session universe: {before} telemetry + "
-              f"{len(raw_session_metas) - before} JSONL gap-fill = {len(raw_session_metas)}")
+        tele = len(raw_session_metas)
+        raw_session_metas = session_index.merge_jsonl_primary(jsonl_sessions, raw_session_metas)
+        orphans = sum(1 for m in raw_session_metas if m.get("source") == "telemetry")
+        print(f"[batch]   session universe: {len(jsonl_sessions)} JSONL (primary) + "
+              f"{orphans} telemetry-only orphans = {len(raw_session_metas)} "
+              f"(telemetry had {tele})")
 
     return {
         "session_metas": raw_session_metas,
