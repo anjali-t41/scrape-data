@@ -345,6 +345,39 @@ def _tool_target(tool_input) -> str | None:
     return None
 
 
+# Verification-run detection (U2). Best-effort + tunable: a Bash command matching
+# one of these is treated as a test/lint/typecheck/build run, and its pass/fail
+# feeds Usefulness (U5). Typecheck is listed before build so `tsc` classifies as
+# typecheck, not build. Matched against the full command string.
+_VERIFICATION_PATTERNS = [
+    ("test", re.compile(
+        r"\b(pytest|py\.test|jest|vitest|mocha|rspec|phpunit|cargo test|go test|"
+        r"npm (?:run )?test|yarn test|pnpm test|python -m unittest)\b", re.I)),
+    ("lint", re.compile(
+        r"\b(eslint|ruff(?! format)|flake8|pylint|rubocop|golangci-lint|"
+        r"npm run lint|yarn lint|prettier --check|black --check)\b", re.I)),
+    ("typecheck", re.compile(
+        r"\b(mypy|pyright|tsc\b|flow check)\b", re.I)),
+    ("build", re.compile(
+        r"\b(npm run build|yarn build|pnpm build|make\b|cargo build|go build|"
+        r"webpack|vite build|gradle\b|mvn (?:package|compile|verify))\b", re.I)),
+]
+
+
+def _verification_kind(name: str, tool_input) -> str | None:
+    """Classify a Bash command as a verification run (test / lint / typecheck /
+    build), or None. Best-effort and tunable (U2)."""
+    if name != "Bash" or not isinstance(tool_input, dict):
+        return None
+    cmd = tool_input.get("command")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return None
+    for kind, rx in _VERIFICATION_PATTERNS:
+        if rx.search(cmd):
+            return kind
+    return None
+
+
 def _msg_supplemental_error(msg: dict) -> bool:
     """toolUseResult-level is_error/status (rarely set in practice) — kept as a
     supplement to the content-block is_error for tools that do populate it."""
@@ -417,6 +450,7 @@ def _signals_from_jsonl(
                     pending[b["id"]] = {
                         "name": b.get("name", ""),
                         "target": _tool_target(b.get("input")),
+                        "vkind": _verification_kind(b.get("name", ""), b.get("input")),
                         "ts": ts,
                     }
         elif mtype == "user":
@@ -431,6 +465,7 @@ def _signals_from_jsonl(
                     if call is not None:
                         calls.append({
                             "name": call["name"], "target": call["target"],
+                            "vkind": call["vkind"],
                             "is_error": bool(block_err or supplemental_err),
                             "interrupted": interrupted,
                             "ts": call["ts"],
@@ -460,16 +495,24 @@ def _signals_from_jsonl(
     # tool_use blocks with no matching result (truncated session / no result msg).
     for call in pending.values():
         calls.append({
-            "name": call["name"], "target": call["target"],
+            "name": call["name"], "target": call["target"], "vkind": call["vkind"],
             "is_error": None, "interrupted": False, "ts": call["ts"],
         })
 
     records = []
     for s, e in raw_segs:
+        in_seg = [c for c in calls if s <= c["ts"] <= e]
         seg_calls = [
             {"name": c["name"], "target": c["target"], "is_error": c["is_error"],
              "interrupted": c["interrupted"], "ts": c["ts"].isoformat()}
-            for c in calls if s <= c["ts"] <= e
+            for c in in_seg
+        ]
+        # U2: verification runs with a resolved outcome (unresolved → no pass/fail).
+        verification = [
+            {"kind": c["vkind"],
+             "passed": c["is_error"] is False and not c["interrupted"],
+             "ts": c["ts"].isoformat()}
+            for c in in_seg if c["vkind"] and c["is_error"] is not None
         ]
         records.append({
             "session_id":         session_id,
@@ -478,6 +521,7 @@ def _signals_from_jsonl(
             "end_ts":             e.isoformat(),
             "is_sidechain":       is_sidechain,
             "tool_calls":         seg_calls,
+            "verification":       verification,
             "ended_in_interrupt": any(s <= it <= e for it in interrupt_ts),
         })
     return records

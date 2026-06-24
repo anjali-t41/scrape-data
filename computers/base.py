@@ -35,7 +35,8 @@ class ComputeContext:
     # ── per-tool-call signal stream (U1: efficiency/usefulness/QAAH backbone) ──
     # One record per busy segment: {session_id, developer_key, start_ts, end_ts,
     # is_sidechain, tool_calls: [{name, target, is_error, interrupted, ts}],
-    # ended_in_interrupt}. Empty when not collected (daily-only / pre-signal store).
+    # verification: [{kind, passed, ts}], ended_in_interrupt}. Empty when not
+    # collected (daily-only / pre-signal store).
     segment_signals:  list = field(default_factory=list)
 
     # ── run params ─────────────────────────────────────────────────────────────

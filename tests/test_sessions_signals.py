@@ -145,6 +145,59 @@ def test_collect_segments_shape_unchanged():
     }, segs[0].keys()
 
 
+def test_verification_pass_detected():
+    """A passing test run is captured as verification {kind: test, passed: True}."""
+    recs = _parse([
+        _human("2026-06-24T10:00:00Z"),
+        _tool_use("2026-06-24T10:00:05Z", "t1", "Bash", {"command": "pytest -q tests/"}),
+        _tool_result("2026-06-24T10:00:30Z", "t1", {"stdout": "5 passed"}, block_is_error=False),
+    ])
+    v = recs[0]["verification"]
+    assert len(v) == 1 and v[0]["kind"] == "test" and v[0]["passed"] is True, v
+
+
+def test_verification_failure_detected():
+    """A failing build (content-block is_error) is captured as passed: False."""
+    recs = _parse([
+        _human("2026-06-24T11:00:00Z"),
+        _tool_use("2026-06-24T11:00:05Z", "t1", "Bash", {"command": "npm run build"}),
+        _tool_result("2026-06-24T11:00:20Z", "t1", {"stderr": "error"}, block_is_error=True),
+    ])
+    v = recs[0]["verification"]
+    assert len(v) == 1 and v[0]["kind"] == "build" and v[0]["passed"] is False, v
+
+
+def test_non_verification_command_ignored():
+    """A plain command (git status) produces no verification signal."""
+    recs = _parse([
+        _human("2026-06-24T12:00:00Z"),
+        _tool_use("2026-06-24T12:00:05Z", "t1", "Bash", {"command": "git status"}),
+        _tool_result("2026-06-24T12:00:06Z", "t1", {"stdout": "clean"}, block_is_error=False),
+    ])
+    assert recs[0]["verification"] == [], recs[0]["verification"]
+
+
+def test_typecheck_classified_not_build():
+    """`tsc --noEmit` classifies as typecheck, not build (ordering matters)."""
+    recs = _parse([
+        _human("2026-06-24T13:00:00Z"),
+        _tool_use("2026-06-24T13:00:05Z", "t1", "Bash", {"command": "tsc --noEmit"}),
+        _tool_result("2026-06-24T13:00:10Z", "t1", {"stdout": ""}, block_is_error=False),
+    ])
+    assert recs[0]["verification"][0]["kind"] == "typecheck", recs[0]["verification"]
+
+
+def test_unresolved_verification_has_no_outcome():
+    """A verification command with no result (unresolved) yields no pass/fail."""
+    recs = _parse([
+        _human("2026-06-24T14:00:00Z"),
+        _tool_use("2026-06-24T14:00:05Z", "t1", "Bash", {"command": "pytest"}),
+        _tool_use("2026-06-24T14:00:30Z", "t2", "Read", {"file_path": "x.py"}),
+        _tool_result("2026-06-24T14:00:31Z", "t2", {"stdout": ""}, block_is_error=False),
+    ])
+    assert recs[0]["verification"] == [], recs[0]["verification"]
+
+
 # Discovered: collect_segments is imported to keep the module-level contract in view;
 # its behavior is covered by the shape guard above via _segments_from_jsonl.
 _ = collect_segments
