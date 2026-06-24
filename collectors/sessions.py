@@ -394,6 +394,22 @@ def _msg_interrupted(msg: dict) -> bool:
     return bool(tur.get("interrupted")) if isinstance(tur, dict) else False
 
 
+def _patch_lines(msg: dict) -> tuple[str | None, list[str], list[str]]:
+    """(filePath, added_lines, removed_lines) from the toolUseResult.structuredPatch
+    of an edit tool result (U3 churn). structuredPatch lives on toolUseResult."""
+    tur = msg.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return None, [], []
+    added, removed = [], []
+    for hunk in tur.get("structuredPatch", []) or []:
+        for ln in hunk.get("lines", []) or []:
+            if ln.startswith("+"):
+                added.append(ln[1:])
+            elif ln.startswith("-"):
+                removed.append(ln[1:])
+    return tur.get("filePath"), added, removed
+
+
 def _result_blocks(msg: dict) -> list[tuple[str, bool]]:
     """(tool_use_id, is_error) from content tool_result blocks. `is_error` lives on
     the content block (the authoritative per-call error source — see header note),
@@ -458,6 +474,7 @@ def _signals_from_jsonl(
             if blocks:
                 interrupted = _msg_interrupted(msg)
                 supplemental_err = _msg_supplemental_error(msg)
+                fp, added, removed = _patch_lines(msg)
                 if interrupted and ts:
                     interrupt_ts.append(ts)
                 for tuid, block_err in blocks:
@@ -469,6 +486,7 @@ def _signals_from_jsonl(
                             "is_error": bool(block_err or supplemental_err),
                             "interrupted": interrupted,
                             "ts": call["ts"],
+                            "patch_fp": fp, "added": added, "removed": removed,
                         })
 
         # ── segment building (mirrors _segments_from_jsonl) ──
@@ -497,7 +515,30 @@ def _signals_from_jsonl(
         calls.append({
             "name": call["name"], "target": call["target"], "vkind": call["vkind"],
             "is_error": None, "interrupted": False, "ts": call["ts"],
+            "patch_fp": None, "added": [], "removed": [],
         })
+
+    # ── churn (U3): agent-added lines later reverted/overwritten in the same session ──
+    # Walk edits in time order; a removed line that matches a line added earlier this
+    # session marks that earlier addition as not-survived. added_records keep the
+    # adding ts so churn attributes to the segment where the line was written.
+    added_records: list[dict] = []
+    pool: dict[str, list[dict]] = {}   # filePath -> still-alive added records
+    for c in sorted(calls, key=lambda c: c["ts"]):
+        fp = c.get("patch_fp")
+        if not fp:
+            continue
+        alive = pool.setdefault(fp, [])
+        for text in c.get("removed", []):
+            for i, rec in enumerate(alive):
+                if rec["text"] == text:
+                    rec["reverted"] = True
+                    alive.pop(i)
+                    break
+        for text in c.get("added", []):
+            rec = {"ts": c["ts"], "text": text, "reverted": False}
+            added_records.append(rec)
+            alive.append(rec)
 
     records = []
     for s, e in raw_segs:
@@ -514,6 +555,13 @@ def _signals_from_jsonl(
              "ts": c["ts"].isoformat()}
             for c in in_seg if c["vkind"] and c["is_error"] is not None
         ]
+        seg_added = [r for r in added_records if s <= r["ts"] <= e]
+        reverted_n = sum(1 for r in seg_added if r["reverted"])
+        churn = {
+            "added":    len(seg_added),
+            "survived": len(seg_added) - reverted_n,
+            "reverted": reverted_n,
+        }
         records.append({
             "session_id":         session_id,
             "developer_key":      developer_key,
@@ -522,6 +570,7 @@ def _signals_from_jsonl(
             "is_sidechain":       is_sidechain,
             "tool_calls":         seg_calls,
             "verification":       verification,
+            "churn":              churn,
             "ended_in_interrupt": any(s <= it <= e for it in interrupt_ts),
         })
     return records

@@ -198,6 +198,56 @@ def test_unresolved_verification_has_no_outcome():
     assert recs[0]["verification"] == [], recs[0]["verification"]
 
 
+def test_churn_survived_lines():
+    """Lines added and never removed report survived == added, reverted == 0."""
+    recs = _parse([
+        _human("2026-06-24T10:00:00Z"),
+        _tool_use("2026-06-24T10:00:05Z", "t1", "Edit", {"file_path": "a.py"}),
+        _tool_result("2026-06-24T10:00:06Z", "t1",
+                     {"filePath": "a.py", "structuredPatch": [{"lines": ["+x", "+y", " z"]}]}),
+    ])
+    assert recs[0]["churn"] == {"added": 2, "survived": 2, "reverted": 0}, recs[0]["churn"]
+
+
+def test_churn_reverted_lines():
+    """A line added then removed later in-session counts as reverted (not survived)."""
+    recs = _parse([
+        _human("2026-06-24T11:00:00Z"),
+        _tool_use("2026-06-24T11:00:05Z", "t1", "Edit", {"file_path": "a.py"}),
+        _tool_result("2026-06-24T11:00:06Z", "t1",
+                     {"filePath": "a.py", "structuredPatch": [{"lines": ["+foo", "+bar"]}]}),
+        _tool_use("2026-06-24T11:00:20Z", "t2", "Edit", {"file_path": "a.py"}),
+        _tool_result("2026-06-24T11:00:21Z", "t2",
+                     {"filePath": "a.py", "structuredPatch": [{"lines": ["-foo"]}]}),
+    ])
+    c = recs[0]["churn"]
+    assert c["added"] == 2 and c["reverted"] == 1 and c["survived"] == 1, c
+
+
+def test_churn_no_cross_file_attribution():
+    """Removing an identical line from a different file must not revert another file's add."""
+    recs = _parse([
+        _human("2026-06-24T12:00:00Z"),
+        _tool_use("2026-06-24T12:00:05Z", "t1", "Edit", {"file_path": "a.py"}),
+        _tool_result("2026-06-24T12:00:06Z", "t1",
+                     {"filePath": "a.py", "structuredPatch": [{"lines": ["+foo"]}]}),
+        _tool_use("2026-06-24T12:00:20Z", "t2", "Edit", {"file_path": "b.py"}),
+        _tool_result("2026-06-24T12:00:21Z", "t2",
+                     {"filePath": "b.py", "structuredPatch": [{"lines": ["-foo"]}]}),
+    ])
+    assert recs[0]["churn"]["reverted"] == 0, recs[0]["churn"]
+
+
+def test_no_patch_means_zero_churn():
+    """A non-edit call (no structuredPatch) contributes no churn."""
+    recs = _parse([
+        _human("2026-06-24T13:00:00Z"),
+        _tool_use("2026-06-24T13:00:05Z", "t1", "Bash", {"command": "ls"}),
+        _tool_result("2026-06-24T13:00:06Z", "t1", {"stdout": "files"}),
+    ])
+    assert recs[0]["churn"] == {"added": 0, "survived": 0, "reverted": 0}, recs[0]["churn"]
+
+
 # Discovered: collect_segments is imported to keep the module-level contract in view;
 # its behavior is covered by the shape guard above via _segments_from_jsonl.
 _ = collect_segments
