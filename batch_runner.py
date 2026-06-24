@@ -66,12 +66,14 @@ def _collect(developer_map: list[dict], since: datetime, store: MetricsStore, da
 
     raw_turn_events: list[dict] = []
     raw_busy_segments: list[dict] = []
+    raw_segment_signals: list[dict] = []
     raw_agent_tasks: dict = {}
     if not daily_only:
         logger.info("[batch] Parsing session transcripts (JSONL)...")
         processed = store.processed_sessions()
         raw_turn_events = sessions.collect(developer_map, processed_sessions=processed, since=since)
         raw_busy_segments = sessions.collect_segments(developer_map, since=since)
+        raw_segment_signals = sessions.collect_segment_signals(developer_map, since=since)
         raw_agent_tasks = agent_tasks.collect(developer_map, processed_sessions=processed, since=since)
         logger.info(f"[batch]   {len(raw_turn_events)} turn events, "
                     f"{len(raw_busy_segments)} busy segments, "
@@ -89,10 +91,11 @@ def _collect(developer_map: list[dict], since: datetime, store: MetricsStore, da
                     f"(telemetry had {tele})")
 
     return {
-        "session_metas": raw_session_metas,
-        "turn_events":   raw_turn_events,
-        "busy_segments": raw_busy_segments,
-        "facets":        raw_facets,
+        "session_metas":   raw_session_metas,
+        "turn_events":     raw_turn_events,
+        "busy_segments":   raw_busy_segments,
+        "segment_signals": raw_segment_signals,
+        "facets":          raw_facets,
         "app_state":     raw_app_state,
         "plans":         raw_plans,
         "agent_tasks":   raw_agent_tasks,
@@ -134,6 +137,7 @@ def _compute(raw: dict, team_size: int | None, week: str, store: MetricsStore,
         turns_by_session = dict(turns_by_session),
         skill_events     = skill_events,
         busy_segments    = raw.get("busy_segments") or [],
+        segment_signals  = raw.get("segment_signals") or [],
         turn_events      = te,
         facets           = raw["facets"],
         plans            = raw["plans"],

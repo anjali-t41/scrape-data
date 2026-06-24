@@ -311,6 +311,218 @@ def collect_segments(
     return all_segs
 
 
+# ── Per-tool-call signal stream (U1: efficiency / usefulness / QAAH backbone) ──
+#
+# collect_segments() above carries only timing. The quality layer needs to know,
+# per busy segment, which tool calls failed, were interrupted, and on what target
+# (so a failure can be matched to its later successful retry).
+#
+# IMPLEMENTATION-TIME CORRECTION (U1): the plan specified reading `is_error` from the
+# top-level `toolUseResult` object to match collectors/session_index.py. Real
+# transcripts contradict this — `toolUseResult` carries NO `is_error`/`status` field
+# (0 of 3.5k sampled results), so that source reports zero failures. The error flag
+# lives on the content `tool_result` block (`is_error`), which is the authoritative
+# per-call source here. We read `is_error` from the content block (with the
+# toolUseResult is_error/status kept as a supplement for tools that do set it), and
+# `interrupted` from `toolUseResult` (which IS present). NOTE: session_index.py's
+# `tool_errors` reads only toolUseResult and is therefore near-blind — flagged for a
+# follow-up fix, out of U1 scope. The tool_use->tool_result correlation by
+# tool_use_id is new code (no prior linkage existed in the codebase).
+
+
+def _tool_target(tool_input) -> str | None:
+    """Best-effort normalized target for a tool call: edited file path, or command
+    head. Lets retry-of-the-same-target detection (efficiency, U4) key on it."""
+    if not isinstance(tool_input, dict):
+        return None
+    for key in ("file_path", "filePath", "path", "notebook_path"):
+        v = tool_input.get(key)
+        if v:
+            return str(v)
+    cmd = tool_input.get("command")
+    if isinstance(cmd, str) and cmd.strip():
+        return cmd.strip().split()[0]
+    return None
+
+
+def _msg_supplemental_error(msg: dict) -> bool:
+    """toolUseResult-level is_error/status (rarely set in practice) — kept as a
+    supplement to the content-block is_error for tools that do populate it."""
+    tur = msg.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return False
+    status = str(tur.get("status", "")).lower()
+    return bool(tur.get("is_error") or status in ("error", "failed"))
+
+
+def _msg_interrupted(msg: dict) -> bool:
+    """Per-call interrupt flag — lives on the top-level `toolUseResult`."""
+    tur = msg.get("toolUseResult")
+    return bool(tur.get("interrupted")) if isinstance(tur, dict) else False
+
+
+def _result_blocks(msg: dict) -> list[tuple[str, bool]]:
+    """(tool_use_id, is_error) from content tool_result blocks. `is_error` lives on
+    the content block (the authoritative per-call error source — see header note),
+    and tool_use_id is the join key back to the originating assistant tool_use."""
+    content = msg.get("message", {}).get("content", "")
+    if not isinstance(content, list):
+        return []
+    return [
+        (b["tool_use_id"], bool(b.get("is_error")))
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
+    ]
+
+
+def _signals_from_jsonl(
+    path: Path, developer_key: str, session_id: str, is_sidechain: bool
+) -> list[dict]:
+    """Build per-segment tool-call signal records from one JSONL file.
+
+    Single pass: segment boundaries are built with the SAME human/agent classify +
+    idle-split logic as _segments_from_jsonl (so windows match collect_segments),
+    while tool calls are correlated (tool_use -> toolUseResult) and bucketed into
+    those windows by timestamp containment.
+    """
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+
+    raw_segs: list[tuple[datetime, datetime]] = []
+    cur_start: datetime | None = None
+    last_ts: datetime | None = None
+
+    pending: dict[str, dict] = {}        # tool_use_id -> {name, target, ts}
+    calls: list[dict] = []               # correlated tool calls (with native ts)
+    interrupt_ts: list[datetime] = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+
+        ts = _parse_iso(msg.get("timestamp")) if msg.get("timestamp") else None
+        mtype = msg.get("type")
+
+        # ── tool-call correlation ──
+        if mtype == "assistant" and ts:
+            for b in msg.get("message", {}).get("content", []) or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                    pending[b["id"]] = {
+                        "name": b.get("name", ""),
+                        "target": _tool_target(b.get("input")),
+                        "ts": ts,
+                    }
+        elif mtype == "user":
+            blocks = _result_blocks(msg)
+            if blocks:
+                interrupted = _msg_interrupted(msg)
+                supplemental_err = _msg_supplemental_error(msg)
+                if interrupted and ts:
+                    interrupt_ts.append(ts)
+                for tuid, block_err in blocks:
+                    call = pending.pop(tuid, None)
+                    if call is not None:
+                        calls.append({
+                            "name": call["name"], "target": call["target"],
+                            "is_error": bool(block_err or supplemental_err),
+                            "interrupted": interrupted,
+                            "ts": call["ts"],
+                        })
+
+        # ── segment building (mirrors _segments_from_jsonl) ──
+        kind = _classify(msg)
+        if kind is None or not ts:
+            continue
+        if kind == "human":
+            if cur_start and last_ts and last_ts > cur_start:
+                raw_segs.append((cur_start, last_ts))
+            cur_start = last_ts = ts
+        else:
+            if cur_start is None:
+                cur_start = last_ts = ts
+            else:
+                if last_ts and (ts - last_ts).total_seconds() > _MAX_GAP_S:
+                    if last_ts > cur_start:
+                        raw_segs.append((cur_start, last_ts))
+                    cur_start = ts
+                last_ts = ts
+
+    if cur_start and last_ts and last_ts > cur_start:
+        raw_segs.append((cur_start, last_ts))
+
+    # tool_use blocks with no matching result (truncated session / no result msg).
+    for call in pending.values():
+        calls.append({
+            "name": call["name"], "target": call["target"],
+            "is_error": None, "interrupted": False, "ts": call["ts"],
+        })
+
+    records = []
+    for s, e in raw_segs:
+        seg_calls = [
+            {"name": c["name"], "target": c["target"], "is_error": c["is_error"],
+             "interrupted": c["interrupted"], "ts": c["ts"].isoformat()}
+            for c in calls if s <= c["ts"] <= e
+        ]
+        records.append({
+            "session_id":         session_id,
+            "developer_key":      developer_key,
+            "start_ts":           s.isoformat(),
+            "end_ts":             e.isoformat(),
+            "is_sidechain":       is_sidechain,
+            "tool_calls":         seg_calls,
+            "ended_in_interrupt": any(s <= it <= e for it in interrupt_ts),
+        })
+    return records
+
+
+def collect_segment_signals(
+    developer_map: list[dict],
+    since: datetime | None = None,
+) -> list[dict]:
+    """Per-segment tool-call signals across all claude dirs — parallel to
+    collect_segments(), same three sources and is_sidechain tagging. Carries the
+    error / interrupt / target signals the time-only busy segments omit."""
+    all_sigs: list[dict] = []
+    for dev in developer_map:
+        key = dev["developer_key"]
+        for claude_dir_str in dev["claude_dirs"]:
+            projects_dir = Path(claude_dir_str) / "projects"
+            if not projects_dir.exists():
+                continue
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                for jsonl_file in project_dir.glob("*.jsonl"):
+                    if since and _too_old(jsonl_file, since):
+                        continue
+                    all_sigs.extend(
+                        _signals_from_jsonl(jsonl_file, key, jsonl_file.stem, False)
+                    )
+                for sub_file in project_dir.glob("*/subagents/*.jsonl"):
+                    if since and _too_old(sub_file, since):
+                        continue
+                    all_sigs.extend(
+                        _signals_from_jsonl(sub_file, key, sub_file.parent.parent.name, True)
+                    )
+                for wf_file in project_dir.glob("*/subagents/workflows/*/*.jsonl"):
+                    if wf_file.stem in _WF_SKIP_STEMS:
+                        continue
+                    if since and _too_old(wf_file, since):
+                        continue
+                    all_sigs.extend(
+                        _signals_from_jsonl(wf_file, key, wf_file.parents[3].name, True)
+                    )
+    return all_sigs
+
+
 def collect(
     developer_map: list[dict],
     processed_sessions: set[str] | None = None,
