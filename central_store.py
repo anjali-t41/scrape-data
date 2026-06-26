@@ -291,7 +291,7 @@ _SM_COLS = [
     "git_commits", "git_pushes", "first_prompt", "user_interruptions", "tool_errors",
     "uses_task_agent", "uses_mcp", "uses_web_search", "uses_web_fetch",
     "input_tokens", "output_tokens", "tool_counts", "languages", "user_response_times",
-    "ai_title", "agent_names",
+    "ai_title", "agent_names", "source",
 ]
 
 _TE_COLS = [
